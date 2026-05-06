@@ -277,10 +277,21 @@ async def kafka_consumer_loop():
 @app.on_event("startup")
 async def startup():
     app.state.redis = redis.from_url(REDIS_URL)
-
-    app.state.pg_pool = await asyncpg.create_pool(
-        dsn=POSTGRES_DSN, min_size=1, max_size=5
-    )
+    
+    for attempt in range(10):
+        try:
+            app.state.pg_pool = await asyncpg.create_pool(
+                dsn=POSTGRES_DSN,
+                min_size=1,
+                max_size=5
+            )
+            print("✅ PostgreSQL connected.")
+            break
+        except Exception as e:
+            print(f"⏳ Postgres not ready (attempt {attempt + 1}/10): {e}")
+            if attempt == 9:
+                raise
+            await asyncio.sleep(2 ** attempt)
 
     app.state.kafka_producer = AIOKafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP
