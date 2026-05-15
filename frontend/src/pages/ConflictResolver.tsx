@@ -3,8 +3,9 @@ import type { Conflict, Department } from '../lib/types';
 import { listConflicts, listDepartments, resolveConflict } from '../lib/api';
 import {
   AlertTriangle, CheckCircle2, Clock, RefreshCw, Shield, Info,
-  GitMerge, Check, X
+  GitMerge, Check, X, Sparkles
 } from 'lucide-react';
+import { suggestConflictResolution } from '../lib/api';
 
 const POLICY_CFG = {
   sws_wins: {
@@ -42,14 +43,15 @@ export default function ConflictResolver() {
   const [conflicts, setConflicts] = useState<Conflict[]>([]);
   const [deptMap, setDeptMap] = useState<Record<string, Department>>({});
   const [loading, setLoading] = useState(true);
-  const [filter, setFilter] = useState<'all' | 'open' | 'pending_review' | 'resolved'>('all');
+  const [filter, setFilter] = useState<'all' | 'open' | 'pending_review' | 'resolved'>('open');
   const [resolving, setResolving] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [reasonDraft, setReasonDraft] = useState<Record<string, string>>({});
+  const [aiThinking, setAiThinking] = useState<string | null>(null);
 
   async function load() {
     const [cRes, dRes] = await Promise.all([
-      listConflicts({ status: filter === 'all' ? undefined : filter, limit: 500 }),
+      listConflicts({ limit: 500 }),
       listDepartments(),
     ]);
     const map: Record<string, Department> = {};
@@ -91,6 +93,19 @@ export default function ConflictResolver() {
     showToast('Conflict resolved and written to Audit Store');
     await load();
     setResolving(null);
+  }
+
+  async function askAI(id: string) {
+    setAiThinking(id);
+    try {
+      const res = await suggestConflictResolution(id);
+      setReasonDraft(prev => ({ ...prev, [id]: res.reasoning }));
+      showToast(`AI Suggests: ${res.suggested_winner === 'sws' ? 'SWS' : 'Department'} Value`);
+    } catch (err: any) {
+      showToast(`AI Analysis Failed: ${err.message}`);
+    } finally {
+      setAiThinking(null);
+    }
   }
 
   async function autoResolveAll() {
@@ -298,7 +313,17 @@ export default function ConflictResolver() {
 
                     {conflict.status !== 'resolved' && (
                       <div className="flex flex-col gap-2.5 flex-shrink-0 w-full lg:w-[220px] bg-gray-50 p-4 rounded-lg border border-[#e5edf5]">
-                        <p className="text-[11px] text-navy uppercase tracking-wide font-bold mb-1">Manual Resolution</p>
+                        <div className="flex items-center justify-between mb-1">
+                          <p className="text-[11px] text-navy uppercase tracking-wide font-bold">Manual Resolution</p>
+                          <button 
+                            onClick={() => askAI(conflict.id)}
+                            disabled={aiThinking === conflict.id || resolving === conflict.id}
+                            className="text-[10px] flex items-center gap-1 font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 px-2 py-0.5 rounded transition-colors"
+                          >
+                            {aiThinking === conflict.id ? <RefreshCw size={10} className="animate-spin" /> : <Sparkles size={10} />}
+                            Ask AI
+                          </button>
+                        </div>
                         <textarea
                           rows={2}
                           placeholder="Optional reason or note..."

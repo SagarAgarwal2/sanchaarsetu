@@ -23,12 +23,12 @@ sleep 10
 
 echo ""
 echo "🧪 Running end-to-end tests..."
-python test_e2e.py
+python3 test_e2e.py
 
 echo ""
 echo "📊 Inspecting database..."
 echo ""
-python inspect_db.py audit
+python3 inspect_db.py audit
 
 echo ""
 echo "✅ Demo complete! Next steps:"

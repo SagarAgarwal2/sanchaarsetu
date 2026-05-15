@@ -2,11 +2,11 @@ import { useState, useEffect, useRef } from 'react';
 import {
   LayoutDashboard, GitBranch, AlertTriangle, Map, ScrollText,
   Building2, ChevronLeft, ChevronRight, Activity, Shield,
-  Play, Square, Zap, RefreshCw
+  Play, Square, Zap, RefreshCw, Inbox, Database
 } from 'lucide-react';
-import { simulateEvent, simulateBurst } from '../lib/simulator';
+import { simulateEvent, simulateBurst, simulateChange } from '../lib/simulator';
 
-type Page = 'dashboard' | 'events' | 'conflicts' | 'mappings' | 'audit' | 'departments';
+type Page = 'dashboard' | 'events' | 'conflicts' | 'mappings' | 'audit' | 'dlq' | 'departments';
 
 const navItems: { id: Page; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
@@ -14,6 +14,7 @@ const navItems: { id: Page; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'conflicts', label: 'Conflict Resolver', icon: AlertTriangle },
   { id: 'mappings', label: 'Schema Mappings', icon: Map },
   { id: 'audit', label: 'Audit Trail', icon: ScrollText },
+  { id: 'dlq', label: 'DLQ Inbox', icon: Inbox },
   { id: 'departments', label: 'Department Systems', icon: Building2 },
 ];
 
@@ -51,6 +52,21 @@ export default function Layout({ currentPage, onNavigate, onTick, children }: La
     setEventCount(c => c + 8);
     onTick();
     setBurstLoading(false);
+  }
+
+  const [legacyLoading, setLegacyLoading] = useState(false);
+  async function handleLegacyChange() {
+    setLegacyLoading(true);
+    const ubid = `UBID-LGCY-${Math.floor(Math.random()*10000).toString().padStart(4, '0')}`;
+    await simulateChange({
+      department: "factories",
+      ubid: ubid,
+      event_type: "address_update",
+      payload: { registered_address: "123 Legacy St, Detected via Polling" }
+    });
+    setEventCount(c => c + 1);
+    onTick();
+    setLegacyLoading(false);
   }
 
   return (
@@ -126,11 +142,20 @@ export default function Layout({ currentPage, onNavigate, onTick, children }: La
 
             <button
               onClick={handleBurst}
-              disabled={burstLoading}
+              disabled={burstLoading || legacyLoading}
               className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-md text-[13px] font-medium bg-warning/10 text-warning hover:bg-warning/20 disabled:opacity-50 transition-colors"
             >
               {burstLoading ? <RefreshCw size={14} className="animate-spin" /> : <Zap size={14} fill="currentColor" />}
               Inject 8 Events
+            </button>
+            
+            <button
+              onClick={handleLegacyChange}
+              disabled={burstLoading || legacyLoading}
+              className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-md text-[13px] font-medium bg-purple-500/10 text-purple-600 hover:bg-purple-500/20 disabled:opacity-50 transition-colors"
+            >
+              {legacyLoading ? <RefreshCw size={14} className="animate-spin" /> : <Database size={14} />}
+              Simulate Legacy Poll
             </button>
 
             {eventCount > 0 && (

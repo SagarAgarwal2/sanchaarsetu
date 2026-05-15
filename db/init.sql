@@ -221,3 +221,19 @@ CREATE TABLE IF NOT EXISTS conflict_log (
   resolution TEXT,
   created_at TIMESTAMP DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS dlq_messages (
+  id SERIAL PRIMARY KEY,
+  propagation_event_id UUID,
+  ubid TEXT NOT NULL,
+  event_type TEXT,
+  source_system TEXT,
+  destination_system TEXT,
+  payload JSONB,
+  created_at TIMESTAMP DEFAULT now(),
+  replayed_at TIMESTAMP,
+  UNIQUE(propagation_event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dlq_messages_created_at ON dlq_messages(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dlq_messages_replayed_at ON dlq_messages(replayed_at);

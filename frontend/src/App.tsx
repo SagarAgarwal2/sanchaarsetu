@@ -6,8 +6,9 @@ import ConflictResolver from './pages/ConflictResolver';
 import SchemaMappings from './pages/SchemaMappings';
 import AuditTrail from './pages/AuditTrail';
 import Departments from './pages/Departments';
+import DlqInbox from './pages/DlqInbox';
 
-type Page = 'dashboard' | 'events' | 'conflicts' | 'mappings' | 'audit' | 'departments';
+type Page = 'dashboard' | 'events' | 'conflicts' | 'mappings' | 'audit' | 'dlq' | 'departments';
 
 export default function App() {
   const [page, setPage] = useState<Page>('dashboard');
@@ -24,6 +25,7 @@ export default function App() {
       case 'conflicts': return <ConflictResolver key={refreshKey} />;
       case 'mappings': return <SchemaMappings key={refreshKey} />;
       case 'audit': return <AuditTrail key={refreshKey} />;
+      case 'dlq': return <DlqInbox key={refreshKey} />;
       case 'departments': return <Departments key={refreshKey} />;
     }
   }

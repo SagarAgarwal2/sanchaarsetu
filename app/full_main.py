@@ -6,6 +6,7 @@ import time
 import random
 import uuid
 from typing import Any
+from datetime import datetime
 
 import httpx
 import redis.asyncio as redis
@@ -25,6 +26,7 @@ KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgres://postgres:postgres@localhost:5432/sanchaar")
 TOPIC = "sanchaar-events"
+DLQ_TOPIC = "sanchaar-dlq"
 
 
 class SWSWebhook(BaseModel):
@@ -50,7 +52,7 @@ class MappingCreateBody(BaseModel):
 class MappingUpdateBody(BaseModel):
     status: str | None = None
     reviewed_by: str | None = None
-    reviewed_at: str | None = None
+    reviewed_at: datetime | None = None
     confidence_score: float | None = None
 
 
@@ -69,6 +71,27 @@ class ReplayEventBody(BaseModel):
     destination_system: str
     payload_hash: str | None = None
     direction: str = 'sws_to_dept'
+    payload: dict | None = None
+
+
+class DeptWebhook(BaseModel):
+    ubid: str
+    event_type: str
+    payload: dict
+    timestamp: float | None = None
+
+
+class DeliveryBody(BaseModel):
+    ubid: str
+    payload: dict
+    idempotency: str | None = None
+
+
+class SimulateChangeBody(BaseModel):
+    department: str = "factories"  # domain or code
+    ubid: str
+    event_type: str = "address_update"
+    payload: dict
 
 
 app = FastAPI(title="SanchaarSetu Full Demo")
@@ -84,11 +107,15 @@ app.add_middleware(
 
 app.state.kafka_producer: AIOKafkaProducer | None = None
 app.state.kafka_consumer: AIOKafkaConsumer | None = None
+app.state.dlq_consumer: AIOKafkaConsumer | None = None
 app.state.redis: redis.Redis | None = None
 app.state.pg_pool: asyncpg.pool.Pool | None = None
 app.state.consumer_task: asyncio.Task | None = None
+app.state.dlq_consumer_task: asyncio.Task | None = None
+app.state.change_ingest_task: asyncio.Task | None = None
 app.state.conflict_resolver: ConflictResolver | None = None
 app.state.change_detector: ChangeDetector | None = None
+app.state.last_change_event_id: int = 0
 
 
 # ------------------------
@@ -104,6 +131,214 @@ def make_idempotency_key(ubid: str, event_type: str, ts: float, window_seconds: 
 def make_unique_idempotency_key(ubid: str, event_type: str) -> str:
     raw = f"{ubid}:{event_type}:{uuid.uuid4().hex}"
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def make_change_event_idempotency_key(change_event_id: int, ubid: str, event_type: str) -> str:
+    raw = f"change_event:{change_event_id}:{ubid}:{event_type}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _pick_conflicting_field(payload1: dict[str, Any], payload2: dict[str, Any]) -> tuple[str, str | None, str | None]:
+    keys = sorted(set(payload1.keys()) & set(payload2.keys()))
+    for k in keys:
+        v1 = payload1.get(k)
+        v2 = payload2.get(k)
+        if str(v1) != str(v2):
+            return k, None if v1 is None else str(v1), None if v2 is None else str(v2)
+    return "payload", json.dumps(payload1, sort_keys=True), json.dumps(payload2, sort_keys=True)
+
+
+async def create_conflict_from_detection(
+    pg_pool: asyncpg.pool.Pool,
+    conflict: dict[str, Any],
+    propagation_event_id: str | None,
+) -> dict[str, Any]:
+    ubid = conflict.get("ubid")
+    source1 = conflict.get("source1")
+    source2 = conflict.get("source2")
+    payload1 = conflict.get("payload1") or {}
+    payload2 = conflict.get("payload2") or {}
+
+    field_name, v1, v2 = _pick_conflicting_field(payload1, payload2)
+
+    # Prefer SWS vs Dept orientation for values.
+    sws_value = None
+    dept_value = None
+    dept_code = None
+
+    if source1 == "SWS":
+        sws_value = v1
+        dept_value = v2
+        dept_code = source2
+    elif source2 == "SWS":
+        sws_value = v2
+        dept_value = v1
+        dept_code = source1
+    else:
+        # Dept vs Dept (rare in demo). Keep ordering stable.
+        dept_value = v1
+        sws_value = v2
+        dept_code = source1
+
+    async with pg_pool.acquire() as conn:
+        dept_row = None
+        if dept_code and dept_code != "SWS":
+            dept_row = await conn.fetchrow("SELECT id FROM departments WHERE code = $1", dept_code)
+        dept_id = dept_row["id"] if dept_row else None
+
+        existing = await conn.fetchrow(
+            """
+            SELECT * FROM conflicts
+            WHERE ubid = $1 AND field_name = $2 AND status IN ('open','pending_review')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            ubid,
+            field_name,
+        )
+        if existing:
+            return dict(existing)
+
+        row = await conn.fetchrow(
+            """
+            INSERT INTO conflicts(
+              ubid, field_name, sws_value, dept_value, source_department_id,
+              resolution_policy, status, propagation_event_id
+            ) VALUES ($1,$2,$3,$4,$5,'manual_review','pending_review',$6)
+            RETURNING *
+            """,
+            ubid,
+            field_name,
+            sws_value,
+            dept_value,
+            dept_id,
+            propagation_event_id,
+        )
+        return dict(row)
+
+
+async def publish_dept_change_to_kafka(
+    *,
+    pg_pool: asyncpg.pool.Pool,
+    redis_client: redis.Redis,
+    producer: AIOKafkaProducer,
+    dept_code: str,
+    ubid: str,
+    event_type: str,
+    dept_payload: dict[str, Any],
+    change_event_id: int | None = None,
+) -> dict[str, Any]:
+    ts = time.time()
+    base_idemp = (
+        make_change_event_idempotency_key(change_event_id, ubid, event_type)
+        if change_event_id is not None
+        else make_unique_idempotency_key(ubid, event_type)
+    )
+    idemp = derive_idempotency_key(base_idemp, "SWS", "dept_to_sws")
+
+    ok = await redis_client.set(idemp, "1", ex=3600, nx=True)
+    if not ok:
+        return {"status": "duplicate", "idempotency_key": idemp}
+
+    pe = await create_propagation_event(
+        pg_pool,
+        ubid=ubid,
+        event_type=event_type,
+        source_system=dept_code,
+        destination_system="SWS",
+        direction="dept_to_sws",
+        idempotency_key=idemp,
+        payload=dept_payload,
+        outcome="pending",
+    )
+
+    message = {
+        "propagation_event_id": str(pe["id"]),
+        "ubid": ubid,
+        "event_type": event_type,
+        "payload": dept_payload,
+        "idempotency_key": idemp,
+        "timestamp": ts,
+        "source_system": dept_code,
+        "destination_system": "SWS",
+        "direction": "dept_to_sws",
+        "retry_count": 0,
+    }
+    await producer.send_and_wait(TOPIC, json.dumps(message).encode())
+    await write_audit(pg_pool, ubid, event_type, dept_code, "kafka", payload_hash(dept_payload), idemp, "queued")
+    return {"status": "accepted", "propagation_event_id": str(pe["id"]), "idempotency_key": idemp}
+
+
+async def change_event_ingest_loop():
+    """Consume rows from `change_events` and push them into Kafka pipeline (Dept→SWS)."""
+    pg_pool = app.state.pg_pool
+    producer = app.state.kafka_producer
+    r = app.state.redis
+
+    # Initialize cursor to current max so we only ingest new events after startup.
+    try:
+        row = await fetch_row(pg_pool, "SELECT COALESCE(MAX(id), 0) AS max_id FROM change_events")
+        app.state.last_change_event_id = int(row["max_id"] or 0)
+    except Exception:
+        app.state.last_change_event_id = 0
+
+    while True:
+        try:
+            rows = await fetch_rows(
+                pg_pool,
+                "SELECT id, department, event_type, payload, created_at FROM change_events WHERE id > $1 ORDER BY id ASC LIMIT 100",
+                app.state.last_change_event_id,
+            )
+            if not rows:
+                await asyncio.sleep(2)
+                continue
+
+            for ce in rows:
+                ce_id = int(ce["id"])
+                dept_key = ce.get("department")
+                event_type = ce.get("event_type") or "snapshot_diff"
+                raw_payload = ce.get("payload")
+
+                try:
+                    parsed = json.loads(raw_payload) if isinstance(raw_payload, str) else (raw_payload or {})
+                except Exception:
+                    parsed = {}
+
+                ubid = parsed.get("ubid")
+                dept_payload = parsed.get("payload") if isinstance(parsed, dict) and "payload" in parsed else parsed
+                event_type = parsed.get("event_type") or event_type
+
+                if not ubid or not isinstance(dept_payload, dict):
+                    app.state.last_change_event_id = ce_id
+                    continue
+
+                dept_row = await fetch_row(
+                    pg_pool,
+                    "SELECT code FROM departments WHERE domain = $1 OR code = $1",
+                    dept_key,
+                )
+                if not dept_row:
+                    app.state.last_change_event_id = ce_id
+                    continue
+
+                await publish_dept_change_to_kafka(
+                    pg_pool=pg_pool,
+                    redis_client=r,
+                    producer=producer,
+                    dept_code=dept_row["code"],
+                    ubid=ubid,
+                    event_type=event_type,
+                    dept_payload=dept_payload,
+                    change_event_id=ce_id,
+                )
+
+                app.state.last_change_event_id = ce_id
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"Change ingest error: {e}")
+            await asyncio.sleep(2)
 
 
 def payload_hash(payload: dict) -> str:
@@ -172,6 +407,102 @@ async def count_rows(pg_pool, table: str, where_sql: str = "", *args):
     return int(row["count"]) if row else 0
 
 
+async def ensure_db_schema(pg_pool: asyncpg.pool.Pool) -> None:
+    """Ensure optional columns exist for demo features (safe no-op if already present)."""
+    async with pg_pool.acquire() as conn:
+        await conn.execute("ALTER TABLE propagation_events ADD COLUMN IF NOT EXISTS payload JSONB")
+
+
+def derive_idempotency_key(base: str, destination: str, direction: str) -> str:
+    raw = f"{base}:{direction}:{destination}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+async def create_propagation_event(pg_pool: asyncpg.pool.Pool, *,
+                                  ubid: str,
+                                  event_type: str,
+                                  source_system: str,
+                                  destination_system: str,
+                                  direction: str,
+                                  idempotency_key: str,
+                                  payload: dict,
+                                  outcome: str = "pending",
+                                  conflict_flag: bool = False,
+                                  resolution_applied: str | None = None,
+                                  retry_count: int = 0,
+                                  error_message: str | None = None,
+                                  propagation_ms: int | None = None,
+                                  ) -> dict[str, Any]:
+    row = await fetch_row(
+        pg_pool,
+        """
+        INSERT INTO propagation_events(
+          ubid,event_type,source_system,destination_system,payload_hash,idempotency_key,
+          outcome,direction,conflict_flag,resolution_applied,retry_count,error_message,propagation_ms,payload
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+        RETURNING *
+        """,
+        ubid,
+        event_type,
+        source_system,
+        destination_system,
+        payload_hash(payload),
+        idempotency_key,
+        outcome,
+        direction,
+        conflict_flag,
+        resolution_applied,
+        retry_count,
+        error_message,
+        propagation_ms,
+        json.dumps(payload),
+    )
+    return row
+
+
+async def update_propagation_event(pg_pool: asyncpg.pool.Pool, event_id: str, *,
+                                  outcome: str | None = None,
+                                  retry_count: int | None = None,
+                                  error_message: str | None = None,
+                                  propagation_ms: int | None = None,
+                                  conflict_flag: bool | None = None,
+                                  resolution_applied: str | None = None,
+                                  payload: dict | None = None,
+                                  ) -> None:
+    sets = []
+    args: list[Any] = []
+    if outcome is not None:
+        sets.append(f"outcome = ${len(args)+1}")
+        args.append(outcome)
+    if retry_count is not None:
+        sets.append(f"retry_count = ${len(args)+1}")
+        args.append(retry_count)
+    if error_message is not None:
+        sets.append(f"error_message = ${len(args)+1}")
+        args.append(error_message)
+    if propagation_ms is not None:
+        sets.append(f"propagation_ms = ${len(args)+1}")
+        args.append(propagation_ms)
+    if conflict_flag is not None:
+        sets.append(f"conflict_flag = ${len(args)+1}")
+        args.append(conflict_flag)
+    if resolution_applied is not None:
+        sets.append(f"resolution_applied = ${len(args)+1}")
+        args.append(resolution_applied)
+    if payload is not None:
+        sets.append(f"payload = ${len(args)+1}::jsonb")
+        args.append(json.dumps(payload))
+        sets.append(f"payload_hash = ${len(args)+1}")
+        args.append(payload_hash(payload))
+
+    if not sets:
+        return
+    args.append(event_id)
+    sql = f"UPDATE propagation_events SET {', '.join(sets)} WHERE id = ${len(args)}"
+    async with pg_pool.acquire() as conn:
+        await conn.execute(sql, *args)
+
+
 # ------------------------
 # Delivery Logic
 # ------------------------
@@ -181,47 +512,93 @@ async def deliver_to_department(pg_pool, message: dict):
     event_type = message["event_type"]
     payload = message["payload"]
     idemp = message["idempotency_key"]
-    dept = message.get("dept", "mock-dept")
+    dest_code = message.get("destination_system") or message.get("dept") or "mock-dept"
+    dept_path = message.get("destination_dept_path")
 
-    dept_schema = [
-        "registered_address", "proprietor", "gstin",
-        "signatory", "signatory_pan", "signatory_name",
-        "registration_date"
-    ]
+    if not dept_path and dest_code:
+        dept_row = await fetch_row(
+            pg_pool,
+            "SELECT domain FROM departments WHERE code = $1 OR domain = $1",
+            dest_code,
+        )
+        dept_path = (dept_row.get("domain") if dept_row else None) or dest_code
+
+    mapped_fields = await fetch_rows(
+        pg_pool,
+        """
+        SELECT DISTINCT sm.dept_field
+        FROM schema_mappings sm
+        JOIN departments d ON d.id = sm.department_id
+        WHERE d.code = $1
+        """,
+        dest_code,
+    )
+    dept_schema = [r["dept_field"] for r in mapped_fields] or list(DEPARTMENT_SCHEMAS.get(dept_path, set()))
+    if not dept_schema:
+        dept_schema = [
+            "registered_address", "proprietor", "gstin",
+            "signatory", "signatory_pan", "signatory_name",
+            "registration_date",
+        ]
 
     try:
-        transformed = await transform_payload(pg_pool, dept, payload, dept_schema)
+        transformed = await transform_payload(pg_pool, dest_code, payload, dept_schema, direction="sws_to_dept")
     except Exception:
         transformed = payload
 
     p_hash = payload_hash(transformed)
-    success = False
-
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(
-                f"http://127.0.0.1:8000/dept/{dept}/update",
-                json={"ubid": ubid, "payload": transformed, "idempotency": idemp}
+                f"http://127.0.0.1:8000/dept/{dept_path}/update",
+                json={"ubid": ubid, "payload": transformed, "idempotency": idemp},
+                headers={"X-API-Key": "sws-secret-key"},
             )
 
-            if r.status_code == 200:
-                outcome = "delivered"
-                success = True
-            else:
-                outcome = f"failed:{r.status_code}"
-
+        success = r.status_code == 200
+        outcome = "delivered" if success else f"failed:{r.status_code}"
     except Exception as e:
+        success = False
         outcome = f"error:{str(e)}"
 
-    await write_audit(pg_pool, ubid, event_type, "SWS", dept, p_hash, idemp, outcome)
+    await write_audit(pg_pool, ubid, event_type, "SWS", dest_code, p_hash, idemp, outcome)
+    return outcome, p_hash, success
+
+
+async def deliver_to_sws(pg_pool, message: dict):
+    ubid = message["ubid"]
+    event_type = message["event_type"]
+    payload = message["payload"]
+    idemp = message["idempotency_key"]
+    source_dept = message.get("source_system", "unknown")
+
+    sws_schema = list(DEPARTMENT_SCHEMAS.get("SWS", set()))
+    try:
+        transformed = await transform_payload(pg_pool, source_dept, payload, sws_schema, direction="dept_to_sws")
+    except Exception:
+        transformed = payload
+
+    p_hash = payload_hash(transformed)
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(
+                "http://127.0.0.1:8000/sws/update",
+                json={"ubid": ubid, "payload": transformed, "idempotency": idemp},
+                headers={"X-API-Key": "sws-secret-key"},
+            )
+        success = r.status_code == 200
+        outcome = "success" if success else "failure"
+    except Exception as e:
+        success = False
+        outcome = f"error:{str(e)}"
+
+    await write_audit(pg_pool, ubid, event_type, source_dept, "SWS", p_hash, idemp, outcome)
     return outcome, p_hash, success
 
 
 # ------------------------
 # Kafka Consumer
 # ------------------------
-
-DLQ_TOPIC = "sanchaar-dlq"
 
 async def kafka_consumer_loop():
     consumer = app.state.kafka_consumer
@@ -231,25 +608,41 @@ async def kafka_consumer_loop():
 
     async for msg in consumer:
         try:
+            started = time.time()
             payload = json.loads(msg.value.decode())
 
+            propagation_event_id = payload.get("propagation_event_id")
             ubid = payload.get("ubid")
-            source = payload.get("source", "SWS")
+            source = payload.get("source_system") or payload.get("source") or "SWS"
+            destination = payload.get("destination_system") or payload.get("dept") or "mock-dept"
+            direction = payload.get("direction", "sws_to_dept")
             event_payload = payload.get("payload", {})
             ts = payload.get("timestamp", time.time())
-            retry_count = payload.get("retry_count", 0)
+            retry_count = int(payload.get("retry_count", 0) or 0)
+            resolution_applied = payload.get("resolution_applied")
 
-            conflict = await conflict_resolver.detect_conflict(
-                ubid, source, event_payload, ts
-            )
+            # Basic conflict detection (skip if already resolved/forced)
+            if not resolution_applied:
+                conflict = await conflict_resolver.detect_conflict(ubid, source, event_payload, ts)
+                if conflict:
+                    if propagation_event_id:
+                        await update_propagation_event(
+                            pg_pool,
+                            propagation_event_id,
+                            outcome="conflict",
+                            conflict_flag=True,
+                            error_message="conflict_detected",
+                        )
+                    await create_conflict_from_detection(pg_pool, conflict, propagation_event_id)
+                    # Hold delivery until human resolution.
+                    continue
 
-            if conflict:
-                resolution = await conflict_resolver.resolve_conflict(
-                    conflict, ConflictPolicy.SWS_WINS
-                )
-                print(f"[CONFLICT RESOLVED] {ubid}: {resolution['reason']}")
-
-            outcome, p_hash, success = await deliver_to_department(pg_pool, payload)
+            if direction == "dept_to_sws":
+                outcome, p_hash, success = await deliver_to_sws(pg_pool, payload)
+            else:
+                # Keep backward-compat with older message shape
+                payload["dept"] = destination
+                outcome, p_hash, success = await deliver_to_department(pg_pool, payload)
 
             if not success:
                 max_retries = 4
@@ -258,6 +651,9 @@ async def kafka_consumer_loop():
                     payload["retry_count"] = retry_count
                     backoff_time = 2 ** retry_count  # 2, 4, 8, 16 seconds
                     print(f"[{ubid}] Delivery failed. Retrying in {backoff_time}s (Attempt {retry_count}/{max_retries})")
+
+                    if propagation_event_id:
+                        await update_propagation_event(pg_pool, propagation_event_id, outcome="failure", retry_count=retry_count, error_message=outcome)
                     
                     await asyncio.sleep(backoff_time)
                     await producer.send_and_wait(TOPIC, json.dumps(payload).encode())
@@ -266,8 +662,50 @@ async def kafka_consumer_loop():
                     await producer.send_and_wait(DLQ_TOPIC, json.dumps(payload).encode())
                     await write_audit(pg_pool, ubid, payload.get("event_type"), "SWS", payload.get("dept", "mock-dept"), p_hash, payload.get("idempotency_key"), "dlq")
 
+                    if propagation_event_id:
+                        await update_propagation_event(pg_pool, propagation_event_id, outcome="dlq", retry_count=retry_count, error_message="DLQ")
+            else:
+                took_ms = int((time.time() - started) * 1000)
+                if propagation_event_id:
+                    await update_propagation_event(pg_pool, propagation_event_id, outcome="success", propagation_ms=took_ms, retry_count=retry_count)
+
         except Exception as e:
             print(f"Consumer error: {e}")
+
+
+async def dlq_consumer_loop():
+    """Consume messages from DLQ topic and store them in DB for manual review."""
+    dlq_consumer = app.state.dlq_consumer
+    pg_pool = app.state.pg_pool
+
+    async for msg in dlq_consumer:
+        try:
+            payload = json.loads(msg.value.decode())
+            ubid = payload.get("ubid", "unknown")
+            event_type = payload.get("event_type", "unknown")
+            source_system = payload.get("source_system", "unknown")
+            destination_system = payload.get("destination_system", "unknown")
+
+            # Store in DB with reference to original propagation_event_id if available
+            propagation_event_id = payload.get("propagation_event_id")
+            
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO dlq_messages(propagation_event_id, ubid, event_type, source_system, destination_system, payload, created_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, now())
+                    ON CONFLICT DO NOTHING
+                    """,
+                    propagation_event_id,
+                    ubid,
+                    event_type,
+                    source_system,
+                    destination_system,
+                    json.dumps(payload),
+                )
+            print(f"[DLQ] Stored message for {ubid}")
+        except Exception as e:
+            print(f"DLQ consumer error: {e}")
 
 
 # ------------------------
@@ -286,6 +724,7 @@ async def startup():
                 max_size=5
             )
             print("✅ PostgreSQL connected.")
+            await ensure_db_schema(app.state.pg_pool)
             break
         except Exception as e:
             print(f"⏳ Postgres not ready (attempt {attempt + 1}/10): {e}")
@@ -305,10 +744,19 @@ async def startup():
     )
     await app.state.kafka_consumer.start()
 
+    app.state.dlq_consumer = AIOKafkaConsumer(
+        DLQ_TOPIC,
+        bootstrap_servers=KAFKA_BOOTSTRAP,
+        group_id="sanchaar-dlq-group"
+    )
+    await app.state.dlq_consumer.start()
+
     app.state.conflict_resolver = ConflictResolver(app.state.pg_pool)
     app.state.change_detector = ChangeDetector(app.state.pg_pool)
 
     app.state.consumer_task = asyncio.create_task(kafka_consumer_loop())
+    app.state.dlq_consumer_task = asyncio.create_task(dlq_consumer_loop())
+    app.state.change_ingest_task = asyncio.create_task(change_event_ingest_loop())
 
 
 @app.on_event("shutdown")
@@ -316,8 +764,17 @@ async def shutdown():
     if app.state.consumer_task:
         app.state.consumer_task.cancel()
 
+    if app.state.dlq_consumer_task:
+        app.state.dlq_consumer_task.cancel()
+
+    if app.state.change_ingest_task:
+        app.state.change_ingest_task.cancel()
+
     if app.state.kafka_consumer:
         await app.state.kafka_consumer.stop()
+
+    if app.state.dlq_consumer:
+        await app.state.dlq_consumer.stop()
 
     if app.state.kafka_producer:
         await app.state.kafka_producer.stop()
@@ -380,6 +837,9 @@ async def rate_limit(req: Request, source_system: str = Depends(verify_rbac)):
     return source_system
 
 def validate_schema(payload: dict, expected_fields: set[str]):
+    if not expected_fields:
+        # Unknown schema: permissive to avoid blocking demo flows.
+        return
     incoming_fields = set(payload.keys())
     unexpected = incoming_fields - expected_fields
     if unexpected:
@@ -393,27 +853,56 @@ def validate_schema(payload: dict, expected_fields: set[str]):
 async def sws_webhook(event: SWSWebhook, source: str = Depends(rate_limit)):
     validate_schema(event.payload, DEPARTMENT_SCHEMAS.get("SWS", set()))
     ts = event.timestamp or time.time()
-    idemp = make_idempotency_key(event.ubid, event.event_type, ts)
+    base_idemp = make_idempotency_key(event.ubid, event.event_type, ts)
+
+    # Broadcast to all active departments (demo-safe default).
+    departments = await fetch_rows(
+        app.state.pg_pool,
+        "SELECT code, domain FROM departments WHERE status IN ('active','degraded') ORDER BY ingestion_tier, code",
+    )
+    if not departments:
+        raise HTTPException(status_code=400, detail="no departments configured")
 
     r = app.state.redis
-    ok = await r.set(idemp, "1", ex=3600, nx=True)
+    accepted: list[dict[str, Any]] = []
+    duplicates = 0
 
-    if not ok:
-        return {"status": "duplicate", "idempotency_key": idemp}
+    for d in departments:
+        dept_code = d["code"]
+        dept_path = d.get("domain") or dept_code
+        idemp = derive_idempotency_key(base_idemp, dept_code, "sws_to_dept")
+        ok = await r.set(idemp, "1", ex=3600, nx=True)
+        if not ok:
+            duplicates += 1
+            continue
 
-    message = {
-        "ubid": event.ubid,
-        "event_type": event.event_type,
-        "payload": event.payload,
-        "idempotency_key": idemp,
-        "timestamp": ts,
-        "source": "SWS",
-        "dept": "mock-dept",
-    }
+        pe = await create_propagation_event(
+            app.state.pg_pool,
+            ubid=event.ubid,
+            event_type=event.event_type,
+            source_system="SWS",
+            destination_system=dept_code,
+            direction="sws_to_dept",
+            idempotency_key=idemp,
+            payload=event.payload,
+            outcome="pending",
+        )
 
-    await app.state.kafka_producer.send_and_wait(
-        TOPIC, json.dumps(message).encode()
-    )
+        message = {
+            "propagation_event_id": str(pe["id"]),
+            "ubid": event.ubid,
+            "event_type": event.event_type,
+            "payload": event.payload,
+            "idempotency_key": idemp,
+            "timestamp": ts,
+            "source_system": "SWS",
+            "destination_system": dept_code,
+            "destination_dept_path": dept_path,
+            "direction": "sws_to_dept",
+            "retry_count": 0,
+        }
+        await app.state.kafka_producer.send_and_wait(TOPIC, json.dumps(message).encode())
+        accepted.append({"dept": dept_code, "propagation_event_id": str(pe["id"]), "idempotency_key": idemp})
 
     await write_audit(
         app.state.pg_pool,
@@ -422,31 +911,105 @@ async def sws_webhook(event: SWSWebhook, source: str = Depends(rate_limit)):
         "SWS",
         "kafka",
         payload_hash(event.payload),
-        idemp,
-        "queued",
+        base_idemp,
+        f"broadcast_queued:{len(accepted)}",
     )
 
-    return {"status": "accepted", "idempotency_key": idemp}
+    return {
+        "status": "accepted",
+        "broadcast": True,
+        "targets": len(departments),
+        "accepted": len(accepted),
+        "duplicates": duplicates,
+        "base_idempotency_key": base_idemp,
+        "items": accepted,
+    }
+
+
+@app.post("/dept/{dept}/webhook")
+async def dept_webhook(dept: str, event: DeptWebhook, source: str = Depends(rate_limit)):
+    # Dept → SWS ingestion path
+    validate_schema(event.payload, DEPARTMENT_SCHEMAS.get(dept, set()))
+    dept_row = await fetch_row(
+        app.state.pg_pool,
+        "SELECT code FROM departments WHERE domain = $1 OR code = $1",
+        dept,
+    )
+    if not dept_row:
+        raise HTTPException(status_code=404, detail="unknown department")
+    dept_code = dept_row["code"]
+    ts = event.timestamp or time.time()
+    base_idemp = make_idempotency_key(event.ubid, event.event_type, ts)
+    idemp = derive_idempotency_key(base_idemp, "SWS", "dept_to_sws")
+
+    r = app.state.redis
+    ok = await r.set(idemp, "1", ex=3600, nx=True)
+    if not ok:
+        return {"status": "duplicate", "idempotency_key": idemp}
+
+    pe = await create_propagation_event(
+        app.state.pg_pool,
+        ubid=event.ubid,
+        event_type=event.event_type,
+        source_system=dept_code,
+        destination_system="SWS",
+        direction="dept_to_sws",
+        idempotency_key=idemp,
+        payload=event.payload,
+        outcome="pending",
+    )
+
+    message = {
+        "propagation_event_id": str(pe["id"]),
+        "ubid": event.ubid,
+        "event_type": event.event_type,
+        "payload": event.payload,
+        "idempotency_key": idemp,
+        "timestamp": ts,
+        "source_system": dept_code,
+        "destination_system": "SWS",
+        "direction": "dept_to_sws",
+        "retry_count": 0,
+    }
+    await app.state.kafka_producer.send_and_wait(TOPIC, json.dumps(message).encode())
+    await write_audit(app.state.pg_pool, event.ubid, event.event_type, dept_code, "kafka", payload_hash(event.payload), idemp, "queued")
+    return {"status": "accepted", "propagation_event_id": str(pe["id"]), "idempotency_key": idemp}
 
 
 @app.post("/dept/{dept}/update")
-async def dept_update(dept: str, req: Request, source: str = Depends(rate_limit)):
-    body: dict[str, Any] = await req.json()
-    payload = body.get("payload", {})
+async def dept_update(dept: str, body: DeliveryBody, source: str = Depends(rate_limit)):
+    payload = body.payload or {}
     validate_schema(payload, DEPARTMENT_SCHEMAS.get(dept, set()))
 
     await write_audit(
         app.state.pg_pool,
-        body.get("ubid"),
+        body.ubid,
         "dept_write",
         dept,
         "SanchaarSetu",
-        payload_hash(body.get("payload")),
-        body.get("idempotency"),
+        payload_hash(payload),
+        body.idempotency,
         "accepted",
     )
 
     return {"status": "ok", "dept": dept}
+
+
+@app.post("/sws/update")
+async def sws_update(body: DeliveryBody, source: str = Depends(rate_limit)):
+    # Destination stub for Dept → SWS deliveries.
+    validate_schema(body.payload, DEPARTMENT_SCHEMAS.get("SWS", set()))
+    await write_audit(
+        app.state.pg_pool,
+        body.ubid,
+        "sws_write",
+        "SanchaarSetu",
+        "SWS",
+        payload_hash(body.payload),
+        body.idempotency,
+        "accepted",
+    )
+    return {"status": "ok"}
 
 
 @app.get("/health")
@@ -555,15 +1118,38 @@ async def simulate_event_backend():
         random.randint(80, 2500) if outcome in ("success", "duplicate") else None,
     )
     if outcome == "conflict":
+        field = random.choice(["registered_address", "signatory_name", "gstin", "pan_number"])
+        if field == "registered_address":
+            street_num = random.randint(10, 999)
+            street_names = ["MG Road", "Brigade Road", "Ring Road", "Tech Park", "Industrial Area", "Cross Street", "Main Road"]
+            areas = ["Bengaluru", "Mysuru", "Hubli", "Mangaluru", "Belagavi"]
+            sws_val = f"No. {street_num}, {random.choice(street_names)}, {random.choice(areas)}"
+            dept_val = f"Plot {street_num}, {random.choice(street_names)}, {random.choice(areas)}"
+        elif field == "signatory_name":
+            first_names = ["Rajesh", "Priya", "Abdul", "Anjali", "Suresh", "Kavita", "Ramesh", "Deepa"]
+            last_names = ["Kumar", "Sharma", "Rahman", "Desai", "Patil", "Reddy", "Gowda", "Rao"]
+            first = random.choice(first_names)
+            last = random.choice(last_names)
+            sws_val = f"{first} {last}"
+            dept_val = f"{first} {last[0]}."
+        elif field == "gstin":
+            base = f"29{random.randint(10000, 99999)}A1Z"
+            sws_val = f"{base}5"
+            dept_val = f"{base}6"
+        else:
+            base = f"ABCDE{random.randint(1000, 9999)}"
+            sws_val = f"{base}F"
+            dept_val = f"{base}G"
+
         await app.state.pg_pool.execute(
             """
             INSERT INTO conflicts(ubid, field_name, sws_value, dept_value, source_department_id, resolution_policy, status, winning_value, resolved_by, resolved_at, propagation_event_id, resolution_reason)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now(),$10,$11)
             """,
             ubid,
-            random.choice(["registered_address", "signatory_name", "gstin", "pan_number"]),
-            "SWS value",
-            "Dept value",
+            field,
+            sws_val,
+            dept_val,
             dept["id"],
             random.choice(["sws_wins", "last_write_wins", "manual_review"]),
             random.choice(["open", "pending_review"]),
@@ -577,6 +1163,31 @@ async def simulate_event_backend():
             "UPDATE departments SET records_synced = records_synced + 1, last_sync_at = now() WHERE id = $1",
             dept["id"],
         )
+    if outcome == "dlq":
+        source_system = "SWS" if direction == "sws_to_dept" else dept["code"]
+        destination_system = dept["code"] if direction == "sws_to_dept" else "SWS"
+        await app.state.pg_pool.execute(
+            """
+            INSERT INTO dlq_messages(propagation_event_id, ubid, event_type, source_system, destination_system, payload)
+            VALUES ($1,$2,$3,$4,$5,$6)
+            """,
+            row["id"], ubid, event_type, source_system, destination_system, json.dumps({"simulated": True})
+        )
+
+    # Ensure simulated event appears in true audit trail
+    source_system = "SWS" if direction == "sws_to_dept" else dept["code"]
+    destination_system = dept["code"] if direction == "sws_to_dept" else "SWS"
+    await write_audit(
+        app.state.pg_pool,
+        ubid,
+        event_type,
+        source_system,
+        destination_system,
+        payload_hash({"ubid": ubid, "event_type": event_type}),
+        idemp,
+        outcome
+    )
+
     return row
 
 
@@ -588,26 +1199,51 @@ async def simulate_burst_backend(body: SimulateBody):
     return {"count": len(rows), "rows": rows}
 
 
-@app.post("/propagation-events/replay")
-async def replay_propagation_event(body: ReplayEventBody):
-    idemp = make_unique_idempotency_key(body.ubid, body.event_type)
+@app.post("/simulate/change-detected")
+async def simulate_change_detected(body: SimulateChangeBody):
+    """Create a synthetic `change_events` row (Tier-2/Tier-3 style) which the ingest loop will publish to Kafka."""
+    payload = {"ubid": body.ubid, "event_type": body.event_type, "payload": body.payload}
     row = await fetch_row(
         app.state.pg_pool,
-        """
-        INSERT INTO propagation_events(
-            ubid,event_type,source_system,destination_system,payload_hash,idempotency_key,
-            outcome,direction,conflict_flag,resolution_applied,retry_count,error_message,propagation_ms
-        ) VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,false,NULL,0,NULL,NULL)
-        RETURNING *
-        """,
-        body.ubid,
+        "INSERT INTO change_events(department, event_type, payload) VALUES ($1,$2,$3) RETURNING id, department, event_type, payload, created_at",
+        body.department,
         body.event_type,
-        body.source_system,
-        body.destination_system,
-        body.payload_hash,
-        idemp,
-        body.direction,
+        json.dumps(payload),
     )
+    return row
+
+
+@app.post("/propagation-events/replay")
+async def replay_propagation_event(body: ReplayEventBody):
+    # Create a new pending event and re-queue it to Kafka.
+    idemp = make_unique_idempotency_key(body.ubid, body.event_type)
+    payload = body.payload or {"replay": True}
+    row = await create_propagation_event(
+        app.state.pg_pool,
+        ubid=body.ubid,
+        event_type=body.event_type,
+        source_system=body.source_system,
+        destination_system=body.destination_system,
+        direction=body.direction,
+        idempotency_key=idemp,
+        payload=payload,
+        outcome="pending",
+    )
+
+    message = {
+        "propagation_event_id": str(row["id"]),
+        "ubid": body.ubid,
+        "event_type": body.event_type,
+        "payload": payload,
+        "idempotency_key": idemp,
+        "timestamp": time.time(),
+        "source_system": body.source_system,
+        "destination_system": body.destination_system,
+        "direction": body.direction,
+        "retry_count": 0,
+        "resolution_applied": None,
+    }
+    await app.state.kafka_producer.send_and_wait(TOPIC, json.dumps(message).encode())
     return row
 
 
@@ -651,7 +1287,101 @@ async def update_conflict(conflict_id: str, body: ConflictResolveBody):
     )
     if not row:
         raise HTTPException(status_code=404, detail="conflict not found")
+
+    # If this conflict is tied to a propagation event, apply the winning value and re-queue.
+    if row.get("propagation_event_id") and row.get("winning_value"):
+        pe = await fetch_row(
+            app.state.pg_pool,
+            "SELECT * FROM propagation_events WHERE id = $1",
+            row["propagation_event_id"],
+        )
+        if pe and pe.get("payload"):
+            try:
+                current_payload = pe["payload"] if isinstance(pe["payload"], dict) else json.loads(pe["payload"])
+            except Exception:
+                current_payload = {}
+            new_payload = dict(current_payload)
+            new_payload[row["field_name"]] = row["winning_value"]
+
+            async with app.state.pg_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE propagation_events
+                    SET outcome = 'pending', conflict_flag = false, resolution_applied = $1,
+                        retry_count = 0, error_message = NULL, propagation_ms = NULL,
+                        payload = $2::jsonb, payload_hash = $3
+                    WHERE id = $4
+                    """,
+                    row.get("resolution_policy"),
+                    json.dumps(new_payload),
+                    payload_hash(new_payload),
+                    pe["id"],
+                )
+
+            message = {
+                "propagation_event_id": str(pe["id"]),
+                "ubid": pe["ubid"],
+                "event_type": pe["event_type"],
+                "payload": new_payload,
+                "idempotency_key": pe["idempotency_key"],
+                "timestamp": time.time(),
+                "source_system": pe["source_system"],
+                "destination_system": pe["destination_system"],
+                "direction": pe["direction"],
+                "retry_count": 0,
+                "resolution_applied": row.get("resolution_policy"),
+            }
+            await app.state.kafka_producer.send_and_wait(TOPIC, json.dumps(message).encode())
+
     return row
+
+
+@app.get("/conflicts/{conflict_id}/suggest")
+async def suggest_conflict_resolution(conflict_id: str):
+    """Simulate an LLM analyzing the conflict context and suggesting a resolution."""
+    row = await fetch_row(
+        app.state.pg_pool,
+        "SELECT * FROM conflicts WHERE id = $1",
+        conflict_id
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Conflict not found")
+    
+    # Mock LLM reasoning based on field type and values
+    field = row.get("field_name")
+    sws_val = row.get("sws_value", "")
+    dept_val = row.get("dept_value", "")
+    
+    await asyncio.sleep(1) # Simulate LLM latency
+
+    reasoning = ""
+    suggested_winner = "sws"
+    
+    if field == "registered_address":
+        if len(str(sws_val)) > len(str(dept_val)):
+            reasoning = f"The SWS address '{sws_val}' contains more granular locality information than the Department address. Suggesting SWS as the authoritative record."
+            suggested_winner = "sws"
+        else:
+            reasoning = f"The Department address '{dept_val}' appears more complete or recently updated. Suggesting Department value."
+            suggested_winner = "dept"
+    elif field == "signatory_name":
+        if "." in str(dept_val) and "." not in str(sws_val):
+            reasoning = f"The Department name '{dept_val}' uses an initial, whereas SWS '{sws_val}' uses the full expanded name. Full names are preferred for legal compliance."
+            suggested_winner = "sws"
+        else:
+            reasoning = "Both names appear valid, but the SWS record aligns better with the standard KYC format."
+            suggested_winner = "sws"
+    elif field == "gstin" or field == "pan_number":
+        reasoning = f"Detected standard alphanumeric format for {field.upper()}. The SWS value was verified via API gateway during onboarding. High confidence in SWS."
+        suggested_winner = "sws"
+    else:
+        reasoning = "Based on historical resolution patterns for this department, SWS is typically the system of record."
+        suggested_winner = "sws"
+
+    return {
+        "suggested_winner": suggested_winner,
+        "reasoning": f"✨ AI Analysis: {reasoning}"
+    }
 
 
 @app.get("/schema-mappings")
@@ -793,3 +1523,66 @@ async def reject_mapping(mapping_id: int):
     await pg.execute("UPDATE mapping_registry SET confidence = $1 WHERE id = $2", 0.0, mapping_id)
     row = await pg.fetchrow("SELECT * FROM mapping_registry WHERE id = $1", mapping_id)
     return dict(row)
+
+
+@app.get("/dlq")
+async def list_dlq_messages(limit: int = 100, offset: int = 0):
+    """List all dead-lettered messages for manual review and replay."""
+    pg = app.state.pg_pool
+    clauses = ["dlq_messages"]
+    rows = await pg.fetch(
+        "SELECT id, propagation_event_id, ubid, event_type, source_system, destination_system, payload, created_at FROM dlq_messages WHERE replayed_at IS NULL ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+        limit,
+        offset,
+    )
+    total = await count_rows(pg, "dlq_messages", "WHERE replayed_at IS NULL")
+    return {"data": [dict(r) for r in rows], "total": total}
+
+
+@app.post("/dlq/{dlq_message_id}/replay")
+async def replay_dlq_message(dlq_message_id: int):
+    """Replay a DLQ message: re-publish it to the main Kafka topic and mark it as replayed."""
+    pg = app.state.pg_pool
+    producer = app.state.kafka_producer
+
+    try:
+        dlq_msg = await fetch_row(
+            pg,
+            "SELECT id, propagation_event_id, payload FROM dlq_messages WHERE id = $1",
+            dlq_message_id,
+        )
+        if not dlq_msg:
+            raise HTTPException(status_code=404, detail="DLQ message not found")
+
+        # Parse payload and reset retry count to 0 for fresh retry
+        try:
+            payload = json.loads(dlq_msg["payload"]) if isinstance(dlq_msg["payload"], str) else dlq_msg["payload"]
+        except Exception:
+            payload = dlq_msg["payload"]
+
+        payload["retry_count"] = 0
+        propagation_event_id = dlq_msg.get("propagation_event_id")
+
+        # Re-publish to main Kafka topic
+        await producer.send_and_wait(TOPIC, json.dumps(payload).encode())
+
+        # Mark as replayed in DB
+        async with pg.acquire() as conn:
+            await conn.execute(
+                "UPDATE dlq_messages SET replayed_at = now() WHERE id = $1",
+                dlq_message_id,
+            )
+
+        # If this was tied to a propagation event, reset it to pending
+        if propagation_event_id:
+            await update_propagation_event(
+                pg,
+                propagation_event_id,
+                outcome="pending",
+                retry_count=0,
+                error_message=None,
+            )
+
+        return {"status": "replayed", "dlq_message_id": dlq_message_id, "propagation_event_id": propagation_event_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Replay failed: {str(e)}")
